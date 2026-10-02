@@ -1,0 +1,2 @@
+# Only required to read local CRADLE-Dialogue / DailyDialog Parquet sources.
+pyarrow>=15

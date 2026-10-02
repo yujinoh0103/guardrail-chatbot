@@ -1,0 +1,21 @@
+# Paths are relative to guardbench/. Choose the chatbot model in .env.
+chatbot:
+  backend: openrouter
+  model_id: ${OPENROUTER_CHATBOT_MODEL}
+  base_url: https://openrouter.ai/api/v1
+  api_key_env: OPENROUTER_API_KEY
+  sampling: {temperature: 0.7, max_tokens: 512}
+  timeout: 60.0
+  max_retries: 0
+qwen3guard:
+  backend: local_hf
+  variant: Gen
+  size: 0.6B
+  model_id: Qwen/Qwen3Guard-{variant}-{size}
+  local_path: models/Qwen3Guard-{variant}-{size}
+  revision: fada3b2f655b89601929198343c94cd2f64d93cc
+  device: auto
+  dtype: auto
+  cpu_threads: 8
+  max_new_tokens: 128
+  do_sample: false

@@ -1,0 +1,43 @@
+# Real chatbot. Guard slots currently use mocks, not clinical classifiers.
+input: {response_mode: generate, context_messages: 5}
+nodes:
+  prepare:
+    use: misc/chat_context
+    in: [history, user]
+    out: chat_context
+    params: {max_chars: 8192, recent_messages: 4, summary_chars: 1024, excerpt_chars: 160}
+  g11:
+    use: guard_in/mock
+    in: [context, user]
+    out: g11
+    params: {keywords: [위험]}
+  bot:
+    use: chatbot/default
+    in: [chat_context, 'fb?']
+    out: candidate
+    params: {model: chatbot}
+  g12:
+    use: guard_out/mock
+    in: [context, user, candidate, g11]
+    out: fb
+    params: {mode: fallback}
+  route:
+    use: routers/mock
+    in: [fb, calls]
+    out: next
+    type: router
+    params: {fallback_target: fallback}
+  fallback:
+    use: misc/fallback
+    in: []
+    out: candidate
+    params: {text: '고정된 대체 응답입니다.'}
+flow:
+  - prepare
+  - [g11, bot]
+  - g12
+  - route
+  - fallback
+final: candidate
+outputs: [g11, fb]
+limits: {max_steps: 20}

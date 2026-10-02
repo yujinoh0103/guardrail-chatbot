@@ -9,3 +9,4 @@ models/*
 outputs/*
 !outputs/.gitkeep
 .pytest_cache/
+data/built/recorded/

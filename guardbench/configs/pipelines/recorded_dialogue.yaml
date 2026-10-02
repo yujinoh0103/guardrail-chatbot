@@ -1,0 +1,23 @@
+# Qwen3Guard evaluates the input; g12 produces mock feedback from its result.
+input: {response_mode: recorded, context_messages: 5}
+nodes:
+  g11:
+    use: guard_in/qwen3guard
+    in: [context, user]
+    out: g11
+    params: {model: qwen3guard}
+  source:
+    use: misc/recorded_response
+    in: [recorded_response]
+    out: candidate
+  g12:
+    use: guard_out/mock
+    in: [context, user, candidate, g11]
+    out: fb
+    params: {mode: fallback}
+flow:
+  - [g11, source]
+  - g12
+final: candidate
+outputs: [g11, fb]
+limits: {max_steps: 20}

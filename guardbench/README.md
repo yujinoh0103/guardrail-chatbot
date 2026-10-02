@@ -1,5 +1,223 @@
 # guardbench
 
+## Config 중심 실행과 관리
+
+실험별 동작은 `configs/pipelines/*.yaml`, 모델별 실행 값은 `configs/models.yaml`에서 관리한다.
+기존 노드를 조합하거나 모델·창 크기·분기 정책을 바꾸는 실험은 **config를 수정하고 같은 CLI로 실행**한다.
+실험마다 전용 Python 스크립트를 추가하지 않는다. 새로운 추론 방식이나 평가 로직은
+`src/guardbench/nodes/`의 래퍼로 구현하고, 이후에는 YAML의 `use/params`로 선택한다.
+
+| 관리 대상 | 설정 위치 | 대표 값 |
+| --- | --- | --- |
+| 입력 모드와 가드 평가 창 | pipeline의 `input` | `response_mode`, `context_messages` |
+| 노드 구현과 연결 | pipeline의 `nodes` | `use`, `in`, `out`, `params`, `type` |
+| 순차/병렬 실행과 최종 응답 | pipeline의 `flow`, `final` | `[g11, bot]` 병렬, `final: candidate` |
+| 결과에 남길 노드 출력 | pipeline의 `outputs` | `[g11, fb]` |
+| 재생성/대체 응답 정책 | g12/router/fallback의 `params` | `mode`, `max_retries`, 이동 대상, `text` |
+| 턴 실행 한도 | pipeline의 `limits` | `max_steps` |
+| 모델·장치·생성 설정 | `configs/models.yaml`의 모델 별칭 | `model_id`, `revision`, `device`, sampling 등 |
+| 인증 값 | `guardbench/.env` | 모델 설정의 `api_key_env`에 지정한 환경변수 |
+| 입력 파일·선택 범위·출력 경로 | 실행 CLI | `--data`, `--split`, `--limit`, `--out`, `--concurrency` |
+
+### 상황에 맞는 pipeline 선택
+
+| 상황 | `--pipeline`에 지정할 파일 | 현재 구성 |
+| --- | --- | --- |
+| 저장 응답을 유지하며 Qwen 입력 가드 평가 | `configs/pipelines/recorded_dialogue.yaml` | recorded, Qwen g11 + 저장 응답 source → mock g12 |
+| 실시간 사용자 입력과 실제 챗봇 생성 | `configs/pipelines/live_chat.yaml` | generate, mock g11 + 실제 chatbot → mock g12 → fallback router |
+
+`generate`의 messages 입력은 마지막이 user여야 하며 마지막 user에 대해서만 생성한다.
+`recorded`는 저장된 user/assistant 쌍을 순서대로 평가하고 원래 응답을 유지한다.
+recorded pipeline에는 `chatbot/*` 노드를 선언하지 않고 source 노드를 사용한다.
+JSONL 빌드의 `--mode`도 실행할 pipeline의 `input.response_mode`에 맞춘다.
+
+### config를 바꿀 때 함께 맞추는 값
+
+**노드 선택:** `use: guard_in/qwen3guard`는 등록된 가드 래퍼를,
+`use: chatbot/default`는 실제 챗봇 래퍼를 선택한다. `params` 키는 선택한 클래스의
+생성자 인자와 맞춘다. 예를 들어 Qwen으로 교체하면 mock의 `keywords/scope` 대신
+`model: qwen3guard`를 지정한다. 노드 입출력의 상세 형식은 아래 가드레일 규격을 따른다.
+
+**모델 선택:** `params.model`은 `models.yaml`의 별칭이다. 모델만 바꾸려면 해당 별칭의 값을
+수정하고, 다른 모델 설정 파일을 사용하려면 해당 노드에 다음처럼 지정한다.
+아래는 g11 선언 부분이며 나머지 노드와 flow는 선택한 pipeline에 함께 둔다.
+
+```yaml
+g11:
+  use: guard_in/qwen3guard
+  in: [context, user]
+  out: g11
+  params:
+    model: qwen3guard
+    models_config: configs/models.yaml
+```
+
+챗봇도 자신의 `params.model/models_config`를 사용한다. 별도 models_config를 선택할 때는
+그 파일을 사용할 가드와 챗봇 각각에 지정한다. Chat backend는 `openrouter` 또는
+`openai_compatible`, Qwen 가드는 `local_hf`와 `variant: Gen`을 사용한다.
+Qwen의 size를 바꾸면 model_id/local_path에 적용되는 값과 revision, 실제 로컬 모델 파일을 함께 맞춘다.
+`${OPENROUTER_CHATBOT_MODEL}` 같은 환경변수 치환은 Chat backend의 model_id에서 적용된다.
+YAML 전체에 임의의 환경변수 치환이나 설정 상속을 전제로 작성하지 않는다.
+
+**배선과 실행 순서:** 출력 키를 바꾸면 생산 노드의 `out`, 소비 노드의 `in`, 기록할
+`outputs`를 함께 수정한다. `[g11, bot]`은 같은 단계에서 병렬로 실행되므로
+서로의 출력에 의존할 수 없다. candidate와 g11을 읽는 g12는 그 다음 단계에 둔다.
+router는 `type: router`와 순차 flow 항목으로 선언한다. 이동 대상은 state 키가 아니라
+노드 이름이며, 선언한 모든 노드를 flow에 정확히 한 번 넣는다.
+
+**분기 정책:** `guard_out/mock.params.mode: retry/fallback`과 router의
+`retry_target/fallback_target`을 함께 맞춘다. `max_retries`는 추가 후보 생성 횟수이고
+`limits.max_steps`는 한 턴의 flow 실행 횟수 한도다. fallback이 필요하면
+해당 노드와 `params.text`를 함께 선언한다. 노드가 반환할 feedback 형식과 router가
+읽는 키도 같은 규격으로 유지한다.
+
+**창 크기:** `input.context_messages`는 가드용 최근 메시지 수다.
+`prepare.params.max_chars/recent_messages/summary_chars/excerpt_chars`는 챗봇 입력 압축 값이다.
+가드 창과 챗봇 입력 예산은 각각 해당 config에서 조정한다.
+
+### 공통 실행 명령과 재현 정보
+
+`guardbench/`에서 기존 CLI를 사용한다. 한 실행에는 완결된 pipeline YAML 한 개를 지정한다.
+입력 파일과 출력 경로는 CLI에서 선택하며 pipeline YAML의 `data/out` 키로 설정하지 않는다.
+
+**CRADLE test 대화 한 개 + Qwen g11:** 아래 블록 전체를 콘솔에 붙여 넣는다.
+매번 새 출력 폴더를 만들어 재실행할 수 있다.
+
+```bash
+cd /home/yujin/mentalguardrail-chatbot/guardbench
+source ../.venv/bin/activate
+mkdir -p outputs
+CRADLE_RUN_DIR=$(mktemp -d outputs/cradle_qwen_g11.XXXXXX)
+
+python scripts/run.py \
+  --pipeline configs/pipelines/recorded_dialogue.yaml \
+  --data data/built/recorded/cradle_dialogue.jsonl \
+  --split test --limit 1 --concurrency 1 --show-turns \
+  --out "$CRADLE_RUN_DIR"
+
+printf '결과 폴더: %s\n' "$CRADLE_RUN_DIR"
+```
+
+`$CRADLE_RUN_DIR/turns.jsonl`에서 턴별 입력·응답·g11 결과를,
+`$CRADLE_RUN_DIR/trace.jsonl`에서 노드별 입출력을 확인한다.
+test 전체를 실행하려면 `--limit 1`을 제거하고, 모든 split을 실행하려면 `--split test`도 제거한다.
+모델·장치는 `configs/models.yaml`, 가드 선택과 흐름은 `recorded_dialogue.yaml`에서 바꾼다.
+
+**실시간 대화 + 실제 챗봇:** API 키와 모델 ID를 `.env`에 설정한 뒤 별도로 실행한다.
+
+```bash
+cd /home/yujin/mentalguardrail-chatbot/guardbench
+source ../.venv/bin/activate
+mkdir -p outputs
+LIVE_RUN_DIR=$(mktemp -d outputs/live_run.XXXXXX)
+
+python scripts/chat.py \
+  --pipeline configs/pipelines/live_chat.yaml \
+  --out "$LIVE_RUN_DIR"
+```
+
+CLI의 상대 경로는 현재 작업 디렉터리 기준이다. 노드의 `models_config`와 Qwen의
+상대 `local_path`는 `guardbench/` 기준이다. 다른 디렉터리에서 실행할 때는
+CLI 경로를 절대 경로로 지정하거나 먼저 `guardbench/`로 이동한다.
+설정 로드 시 등록된 use, 생성자 params, 필수 입력의 생산 순서, router 배치,
+reserved output 키, recorded 모드 등을 검증한다. 입력 JSONL은 별도로 검증한다.
+
+실험을 재현하려면 사용한 pipeline/models YAML과 CLI 인자, 입력 원본의 경로·해시를
+결과와 함께 보관한다. 현재 Runner는 config 파일을 결과 폴더에 자동 복사하지 않으므로
+사용한 설정을 직접 함께 저장한다. 인증 값은 `.env`로 관리하고 모델 설정에는 환경변수 이름을 둔다.
+재실행은 새 `--out` 경로를 사용한다. config만으로 제어할 범위가 늘어날 때는
+먼저 해당 노드의 생성자/입출력 규격에 옵션을 추가하고 README와 YAML 예시를 함께 갱신한다.
+
+## 모듈 구조와 교체 기준
+
+노드는 입력을 받아 자기 결과만 반환하고, config는 노드 선택과 연결을 담당한다.
+Runner는 선택된 노드를 실행하며 가드 모델이나 챗봇 provider의 내부 동작을 해석하지 않는다.
+가드레일과 챗봇을 교체할 때는 **입출력 규격을 유지하고 구현 또는 모델 별칭을 선택**한다.
+
+| 모듈 | 책임 | 변경하는 상황 |
+| --- | --- | --- |
+| `scripts/run.py`, `scripts/chat.py` | 배치/실시간 입력, config 선택, 실행 시작 | 공통 CLI 기능을 바꿀 때 |
+| `core/node.py` | Node 인터페이스, 등록과 구현 조회 | 공통 노드 규칙을 바꿀 때 |
+| `core/pipeline.py` | YAML 로드, 입출력 배선·flow 검증 | 공통 config 문법을 바꿀 때 |
+| `core/state.py`, `core/runner.py`, `core/session.py` | 턴 상태, history/context, 실행 순서·병렬·분기 | 공통 실행 동작을 바꿀 때 |
+| `nodes/guard_in/` | 입력 가드 래퍼: context/user → 판정 | 입력 가드 모델이나 평가 로직을 교체할 때 |
+| `nodes/guard_out/` | 응답 평가와 feedback: candidate/g11 → fb | 응답 평가 로직을 교체할 때 |
+| `nodes/chatbot/` | chat_context/fb → 문자열 candidate | 챗봇 입력 구성이나 생성 로직을 교체할 때 |
+| `nodes/misc/` | 입력 준비, 저장 응답 source, fallback | 전처리·응답 공급 방식을 바꿀 때 |
+| `nodes/routers/` | feedback과 호출 수 → 다음 노드 이름 또는 END | 재생성·차단·fallback 정책을 바꿀 때 |
+| `llm/client.py`, `llm/openrouter.py` | 챗봇 모델 설정 조회, backend 선택과 API 호출 | provider/전송 방식을 바꿀 때 |
+| `trace/recorder.py` | 노드 실행과 턴 결과 저장 | 공통 기록 형식을 바꿀 때 |
+
+현재 Qwen의 추론·파싱·모델 재사용은 `nodes/guard_in/qwen3guard.py` 안의 함수로 관리한다.
+여러 노드가 같은 추론/파싱을 실제로 공유하게 되면 필요한 공통 코드를 분리한다.
+새 실험이나 모델 이름만으로 파일·실행 스크립트를 추가하지 않는다.
+
+### 가드레일 교체
+
+g11 구현은 `context, user`를 받아 `label, categories, raw`를 반환하는 규격을 유지한다.
+같은 위치의 `use`와 그 구현이 받는 `params`를 바꾸면 다른 입력 가드를 연결할 수 있다.
+아래는 pipeline의 `nodes` 안에서 사용할 g11 선언 예시다:
+
+```yaml
+g11:
+  use: guard_in/qwen3guard
+  in: [context, user]
+  out: g11
+  params: {model: qwen3guard}
+```
+
+키워드 mock으로 바꾸면 `use: guard_in/mock`,
+`params: {scope: context, keywords: [scared, suicide]}`로 지정한다.
+교체 전 구현의 전용 params를 그대로 넘기지 않는다.
+g12도 `context, user, candidate, g11` 입력과 router가 읽는 feedback 키를 유지하면
+`use/params` 교체로 연결할 수 있다. 모델의 원래 라벨과 출력은 raw에 보존하고
+다음 노드가 읽는 필드는 래퍼에서 맞춘다. 상세 양식은 아래 가드레일 노드 입출력 규격을 따른다.
+
+### 챗봇 교체: 모델, backend, 노드
+
+| 바꾸려는 것 | 변경 위치 | 유지할 연결 |
+| --- | --- | --- |
+| 같은 Chat API 방식의 모델 | `models.yaml`의 model_id/sampling 또는 bot의 `params.model` 별칭 | `use: chatbot/default`, `in/out` |
+| OpenRouter ↔ 호환 API 서버 | 해당 모델 별칭의 backend/base_url/api_key_env | `chatbot/default`의 입력·출력 |
+| mock ↔ 실제 챗봇 | bot의 `use/params` | `in: [chat_context, 'fb?']`, `out: candidate` |
+| 새로운 생성 방식 | `nodes/chatbot/` 래퍼 또는 필요한 backend 구현 | 문자열 candidate 반환 |
+
+챗봇 노드가 받는 `chat_context`는 `{"summary": "...", "messages": [...]}`다.
+messages는 현재 user로 끝나는 role/content 목록이며, `fb?`는 첫 생성에 없으면 None,
+재생성에서는 이전 feedback 객체다. 반환값은 `{"candidate": ...}`가 아니라 **응답 문자열 자체**다.
+다음 가드는 YAML의 `out: candidate`로 저장된 문자열을 읽는다.
+
+`chatbot/default`는 모델 설정을 읽고 `Backend.generate(messages) -> str`로 추론을 호출한다.
+provider 연결은 backend에서 처리하고, 노드는 summary/feedback을 모델 입력으로 구성한다.
+새 backend를 구현할 때는 `generate()`와 `close()` 인터페이스를 맞추고
+`llm/client.py`의 backend 선택 경로에 연결한다. 현재 `openrouter/openai_compatible`은
+`llm/openrouter.py`의 같은 클라이언트를 사용한다.
+로컬 Qwen 가드의 `local_hf` 설정은 가드 래퍼에서 처리한다.
+
+### 노드 등록과 수명 관리
+
+`nodes/<종류>/<구현>.py`의 클래스에 `@register("<종류>/<구현>")`를 붙이고
+`Node`를 상속해 `async run(inputs)`를 구현한다. YAML의 `use`는 이 등록 이름이다.
+예를 들어 `guard_in/qwen3guard`를 선택하면 해당 모듈을 자동 import한다.
+같은 이름을 중복 등록하지 않으며 생성자 인자는 YAML `params`와 맞춘다.
+
+pipeline에서 `g11`, `bot`, `source`는 **노드 인스턴스 이름**, `use`는 **구현 이름**,
+`out`은 **state에 저장할 키**다. 예를 들어 bot의 구현을 교체해도 `out: candidate`를
+유지하면 g12 입력을 그대로 사용할 수 있다. 노드 이름을 바꾸면 flow와 router 이동 대상도 바꾼다.
+입출력 키를 바꾸면 생산자 out, 소비자 in, 기록할 outputs를 함께 수정한다.
+
+노드는 다른 노드를 직접 호출하거나 import해서 연결하지 않는다.
+데이터는 선언한 in/out으로 전달하고 실행 순서와 재생성은 flow/router가 결정한다.
+노드 반환값은 out 하나에 저장하고 history/user/context 등의 초기 상태를 덮어쓰지 않는다.
+가드 정답 라벨은 metadata로 기록하며 모델 입력에 자동으로 섞지 않는다.
+
+config 검증 때 생성자가 호출되고, 실제 실행에서는 턴마다 새 노드 인스턴스를 만든다.
+생성자에서는 설정을 검증하고 모델 로드·API 추론은 run 단계에서 수행한다.
+큰 모델은 설정에 맞는 자원을 재사용하고 공유 접근을 관리한다.
+호출 수·재생성 feedback은 턴 단위이고, 다음 턴으로 이어지는 대화는 Runner/Session의 history로 관리한다.
+API 클라이언트 등 호출 자원은 실패 시에도 정리한다.
+래퍼 교체를 확인할 때는 config 로드, 입력 규격, 출력 형식, history 유지와 trace의 use를 검증한다.
+
 ## 로컬 데이터셋 → 편집 가능한 입력 JSONL
 
 `scripts/build_datasets.py`로 **attunebench, cradle_dialogue, sim_vail, dailydialog,
@@ -99,7 +317,7 @@ python scripts/run.py --pipeline configs/pipelines/recorded_dialogue.yaml \
 ```bash
 python scripts/build_datasets.py --dataset esconv --mode generate --out-dir data/built/generate
 python scripts/build_datasets.py --mode generate --validate-only data/built/generate/esconv.jsonl
-python scripts/run.py --pipeline configs/pipelines/no_guard.yaml \
+python scripts/run.py --pipeline configs/pipelines/live_chat.yaml \
   --data data/built/generate/esconv.jsonl --out outputs/esconv_generate
 ```
 
@@ -138,61 +356,45 @@ Phase 1에서는 모델·네트워크 호출 없이 순수 Python + asyncio 코�
 `guardbench/`에서 실행한다. CLI에 지정하는 상대 경로는 현재 작업 디렉터리 기준이며,
 chatbot의 `models_config` 상대 경로는 `guardbench/` 기준이다.
 
-상위 작업공간에서 실행:
+상위 작업공간에서 환경을 설치한다:
 
 ```bash
 python -m venv .venv
-.venv/bin/python -m pip install torch==2.8.0+cu128 --index-url https://download.pytorch.org/whl/cu128
 .venv/bin/python -m pip install -r guardbench/requirements.txt
-.venv/bin/python guardbench/sandbox/qwen3guard_check.py --download-only
-.venv/bin/python guardbench/sandbox/qwen3guard_check.py
 ```
 
-GPU를 쓸 수 없는 환경은 첫 설치에서 공식 CPU 인덱스의 `torch==2.8.0`을 선택할 수 있다.
-이 작업의 Codex 샌드박스는 GPU와 네트워크 접근을 제한하므로 다운로드·GPU 추론에는 권한 확장 실행이 필요하다.
+Qwen3Guard 실행 설정은 `configs/models.yaml`의 `qwen3guard`에 둔다.
+`variant: Gen`, `size`, `revision`, `local_path`, `device`, `dtype`, `cpu_threads`,
+`max_new_tokens`, `do_sample`을 지정한다. 다운로드된 모델 경로를 사용하며,
+`local_path`와 `model_id`의 `{variant}`, `{size}`는 래퍼에서 치환한다.
+크기를 바꾸면 새 모델의 revision과 로컬 파일도 함께 준비한다.
+`download_manifest.json`이 있으면 설정의 모델 ID/revision과 일치하는지 확인한다.
+`device: auto`는 CUDA를 사용할 수 있을 때 `cuda:0`, 그 외에는 CPU를 선택한다.
+CPU에서 기본 dtype은 float32다. 장치를 고정하려면 `device: cuda:0` 또는 `device: cpu`로 설정한다.
 
-`configs/models.yaml`에서 크기(`size`), 모델 revision, 실행 장치와 생성 길이를 지정한다.
-`size`를 바꿀 때는 새 모델 저장소의 `revision`도 지정한 뒤 다운로드 명령을 다시 실행한다. Stream은 별도 아키텍처이므로 이 Gen 확인 스크립트의 대상이 아니다.
-공개 Qwen 모델은 인증 없이 다운로드할 수 있다. 필요하면 `.env.example`을 `.env`로 복사해 `HF_TOKEN`을 설정한다.
-OpenRouter 키와 모델 ID는 실시간 chatbot에서 사용한다. 위 Qwen 단독 확인 스크립트는 OpenRouter를 호출하지 않는다.
+Qwen 단독 입력 평가는 기존 `scripts/run.py`와 `recorded_dialogue.yaml`로 실행한다.
+OpenRouter 키는 실제 챗봇 후보를 생성하는 `live_chat.yaml`에서 사용한다.
+Phase 0의 모델·템플릿 확인 기록은 [PHASE0_REPORT.md](PHASE0_REPORT.md)에 있다.
 
-확인 스크립트는 공식 모델 카드의 prompt/response 예제와, 이전 user/assistant 한 쌍을 추가한 멀티턴 두 예제를 실행한다.
-다운로드한 tokenizer의 `apply_chat_template(messages, tokenize=False)`를 호출하며 템플릿을 직접 작성하지 않는다.
-공식 response 예제에 있는 모델 ID 순서 오기는 실제 존재하는 `Qwen/Qwen3Guard-Gen-0.6B`로 통일했다.
-생성 설정은 모델 카드와 같이 최대 128 토큰이며, 다운로드한 생성 설정의 결정적 생성을 명시한다.
-
-결과는 `outputs/phase0/`에 저장된다:
-
-- `raw_outputs.jsonl`: 입력 메시지, 렌더링된 입력, raw 출력, 특수 토큰을 포함한 출력, 토큰 ID, 정규식 추출값, latency와 메모리.
-- `environment.json`: 실제 설치 버전, 모델 revision, 장치, dtype, 로드 시간, 메모리.
-- `chat_template.jinja`: 사용한 내장 템플릿 사본.
-
-실행하면 같은 출력 경로를 덮어쓴다. 다른 결과를 보존하려면 `--output-dir`을 지정한다.
-추론은 로컬 파일만 읽는다. 다운로드 시 기록한 revision은 `models/<모델명>/download_manifest.json`에서도 확인할 수 있다.
-측정은 케이스별 1회이며 첫 케이스는 초기 실행이다. 모델 로드 시간을 추론 latency와 분리한다.
-CPU RSS는 10ms 간격으로 관측하며, CUDA 메모리는 PyTorch allocator의 최대 allocated/reserved 값을 기록한다.
-
-전체 확인 결과와 다음 단계의 결정 사항은 [PHASE0_REPORT.md](PHASE0_REPORT.md)에 기록한다.
-
-## 배치 실행과 테스트
+## 배치 실행
 
 상위 작업공간에서 venv를 활성화한 뒤 프로젝트 디렉터리로 이동한다.
 
 ```bash
 source .venv/bin/activate
 cd guardbench
-python -m pip install -r requirements-dev.txt
-python scripts/run.py --pipeline configs/pipelines/parallel_loop.yaml --data data/sample.jsonl --out outputs/my_run --concurrency 4
-python -m pytest -q
+python scripts/build_datasets.py --dataset esconv --mode generate --out-dir data/built/generate
+python scripts/run.py --pipeline configs/pipelines/live_chat.yaml --data data/built/generate/esconv.jsonl --out outputs/my_run --concurrency 4
 ```
 
-pytest 개발 의존성은 `requirements-dev.txt`에 명시했다. 이번 환경에서는 기존 로컬 설치로부터
-pytest 8.4.1과 의존성을 오프라인으로 venv에 설치했으며 네트워크를 사용하지 않았다.
+이 생성 실행은 `models.yaml`에 지정한 실제 챗봇 모델을 호출한다.
+`guardbench/.env`에서 해당 API 키와 모델 ID를 설정한다.
+
 명령에 쓰는 경로는 현재 작업 디렉터리 기준이다. 출력 디렉터리에 trace 파일이 있으면 덮어쓰지 않고 에러를 낸다.
 
 ### 파이프라인 실행과 입출력
 
-대표 설정 `configs/pipelines/parallel_loop.yaml`은 mock 노드로 병렬 가드·챗봇, feedback, 후보 재생성을 확인한다.
+생성은 `configs/pipelines/live_chat.yaml`, 저장 응답 평가는 `configs/pipelines/recorded_dialogue.yaml`을 사용한다.
 `scripts/run.py`는 JSON/JSONL 배치 입력을, `scripts/chat.py`는 실시간 텍스트 입력을 받는다.
 실제 추론 노드는 `chatbot/default`이며, `chatbot/mock`은 테스트용으로 유지한다.
 저장 대화 평가는 JSONL의 role 순서로 처리하며, `recorded` 모드는 저장된 assistant 응답을 보존해 평가 대상으로 쓴다.
@@ -200,8 +402,8 @@ pytest 8.4.1과 의존성을 오프라인으로 venv에 설치했으며 네트�
 
 ```bash
 python scripts/run.py \
-  --pipeline configs/pipelines/parallel_loop.yaml \
-  --data data/sample.jsonl \
+  --pipeline configs/pipelines/live_chat.yaml \
+  --data data/built/generate/esconv.jsonl \
   --out outputs/my_run \
   --concurrency 4
 ```
@@ -235,10 +437,9 @@ flowchart TD
 저장 평가 경로는 `[g11, source] → g12`를 실행하며 chatbot을 호출하지 않는다.
 실제 평가 노드는 recorded YAML의 g11/g12 `use`와 `params`를 교체해 연결한다.
 
-`parallel_loop.yaml`에서 `prepare`는 history와 현재 user를 받아 chatbot용 `chat_context`를 만들고,
-`TurnState`는 평가용 context를 준비한다. g11과 첫 bot 호출은 병렬이다. 이후 g12가 후보와 g11 결과를 받아 feedback을 만들고,
-router가 `bot`을 반환하면 `bot → g12 → router`만 반복한다. 이 YAML은 최대 두 번의 추가 후보 생성을 허용하며,
-그 외에는 `END`로 턴을 마친다. `final`은 현재 candidate다.
+`live_chat.yaml`에서 `prepare`는 history와 현재 user를 받아 chatbot용 `chat_context`를 만들고,
+`TurnState`는 평가용 context를 준비한다. g11과 bot 호출은 병렬이다. g12가 후보와 g11 결과를 받아
+feedback을 만들고 router가 종료 또는 fallback을 선택한다. `final`은 현재 candidate다.
 
 입력 형식:
 
@@ -252,7 +453,7 @@ messages 입력은 user/assistant가 번갈아 나와야 하며 맨 앞의 syste
 
 ```bash
 python scripts/run.py --pipeline configs/pipelines/recorded_dialogue.yaml \
-  --data data/conversation.json --out outputs/recorded_run
+  --data data/built/recorded/esconv.jsonl --out outputs/recorded_run
 ```
 
 출력은 실행마다 새 디렉터리에 생성된다. 기존 `trace.jsonl` 또는 `turns.jsonl`이 있으면 덮어쓰지 않고 오류를 낸다.
@@ -263,21 +464,14 @@ python scripts/run.py --pipeline configs/pipelines/recorded_dialogue.yaml \
 | `turns.jsonl` | 턴별 user, 최종 응답(`final`), history/context, response mode, 메타데이터, 설정한 outputs, latency와 오류. 한 줄에 JSON 턴 하나. |
 
 정상 종료 시 CLI는 대화/턴/오류 개수와 출력 경로를 표시한다. 한 건이라도 턴 오류가 있으면 종료 코드는 0이 아니다.
-동시 실행 수는 `--concurrency`로 조정한다. 네 생성용 테스트 YAML은 mock chatbot을 사용한다. 실시간·저장 평가 설정을 포함한 차이는 다음과 같다:
+동시 실행 수는 `--concurrency`로 조정한다. pipeline은 다음 두 개를 관리한다:
 
 | 설정 | 동작 |
 | --- | --- |
-| `no_guard.yaml` | prepare 후 chatbot 후보를 만든다. |
-| `parallel_loop.yaml` | g11과 chatbot을 병렬 실행하고, feedback에 따라 chatbot 후보를 다시 만든다. |
-| `parallel_fallback.yaml` | 후보 이후 router가 fallback 노드로 보낼 수 있다. |
-| `gate_first.yaml` | g11 판정 후 안전한 입력만 chatbot으로 보내고, 나머지는 fallback으로 보낸다. |
-| `live_chat.yaml` | 실제 chatbot 추론과 mock 가드 평가 후 최종 응답을 반환한다. |
-| `recorded_dialogue.yaml` | g11과 저장 응답 source를 병렬 실행한 뒤 g12가 저장 candidate를 평가한다. 생성 호출은 없다. |
+| `live_chat.yaml` | 실제 chatbot 후보를 만들고 mock 가드·router로 종료 또는 fallback을 선택한다. |
+| `recorded_dialogue.yaml` | Qwen g11과 저장 응답 source를 병렬 실행한 뒤 mock g12로 feedback을 기록한다. |
 
-예시 YAML은 `no_guard`, `parallel_loop`, `parallel_fallback`, `gate_first`다.
-`parallel_loop`는 unsafe 입력에서 후보를 최대 두 번 추가 생성한다.
-`parallel_fallback`은 후보 생성 후, `gate_first`는 후보 생성 전에 unsafe 입력을 fallback으로 보낸다.
-`gate_first`의 `finish` router는 chatbot 이후 `END`를 반환해 뒤에 배치된 fallback을 건너뛴다.
+다른 실행 정책은 필요한 노드와 params/flow를 이 설정에 맞춰 조정한다.
 
 ## 실행 규칙
 
@@ -302,13 +496,13 @@ python scripts/run.py --pipeline configs/pipelines/recorded_dialogue.yaml \
 4. 선언된 입력만 사용하고 출력값을 반환한다. 다른 노드를 import하거나 호출하지 않는다.
 5. YAML의 `use`, `in`, `out`, `params`, `flow`를 연결한다. 모듈은 `use` 경로로 자동 로드된다.
 
-파일별 역할, 테스트 결과와 네 YAML 측정값은 [PHASE1_REPORT.md](PHASE1_REPORT.md)에 정리한다.
+Phase 1의 초기 mock 파이프라인 검증 기록은 [PHASE1_REPORT.md](PHASE1_REPORT.md)에 있다.
 
 ## 대화 한 개 입력과 저장된 대화 처리
 
 JSONL 외에 대화 한 개를 담은 `.json` 파일도 받는다. Python에서는
 `await runner.run(dialogue_dict)`로 대화 dict 하나를 직접 전달할 수 있다.
-기존 `turns: ["user1", "user2"]` 입력과 네 mock YAML도 계속 동작한다.
+`turns: ["user1", "user2"]` 입력은 generate pipeline에서 차례로 사용자 발화로 처리한다.
 
 ```json
 {
@@ -344,8 +538,8 @@ recorded 모드에서 현재 assistant 응답이 없거나 pipeline이 원래 �
 
 ```bash
 # guardbench/에서 venv Python 사용
-python scripts/run.py --pipeline configs/pipelines/recorded_dialogue.yaml --data data/conversation.json --out outputs/my_recorded_run
-python scripts/run.py --pipeline configs/pipelines/no_guard.yaml --data data/conversation_generate.json --out outputs/my_generate_run
+python scripts/run.py --pipeline configs/pipelines/recorded_dialogue.yaml --data data/built/recorded/esconv.jsonl --out outputs/my_recorded_run
+python scripts/run.py --pipeline configs/pipelines/live_chat.yaml --data data/built/generate/esconv.jsonl --out outputs/my_generate_run
 ```
 
 평가용 `context`, 기록용 `history`, chatbot 입력인 `chat_context`는 구분된다:
@@ -357,15 +551,14 @@ python scripts/run.py --pipeline configs/pipelines/no_guard.yaml --data data/con
 - candidate: YAML 노드가 만든 현재 평가 대상 응답. recorded 모드의 성공한 턴에서는 저장된 응답과 동일하다.
 
 창 크기는 `input: {response_mode: recorded, context_messages: 5}`로 설정한다.
-기존 mock 가드 YAML도 g11에는 context와 user를, g12에는 context·user·candidate·g11을 전달하도록 수정했다.
+두 pipeline 모두 g11에는 context와 user를, g12에는 context·user·candidate·g11을 전달한다.
 chatbot은 `prepare`가 만든 `chat_context`만 받는다. 전체 history는 기록과 평가 창 생성에 사용하며 chatbot에 직접 전달하지 않는다.
 
 ### Chatbot 입력 압축
 
-네 mock 생성용 YAML과 `live_chat.yaml`은 `prepare` → chatbot 배선을 사용한다. `misc/chat_context` 노드는
+`live_chat.yaml`은 `prepare` → chatbot 배선을 사용한다. `misc/chat_context` 노드는
 전체 history에서 오래된 메시지의 발췌와 최근 메시지를 만들어 `chat_context`에 저장한다.
 chatbot의 입력 키는 `[chat_context, fb?]`다. 재생성 루프에서는 같은 압축 결과를 재사용한다.
-gate의 unsafe 분기는 압축과 chatbot 호출을 모두 건너뛴다.
 
 ```yaml
 prepare:
@@ -409,7 +602,7 @@ turns.jsonl에는 다음처럼 원래 반환값을 기록한다. 아래 라벨 �
 core는 라벨을 해석하거나 병합하지 않는다. unresolved는 그대로 보존하며 발표용 이진화는 별도 분석 단계의 선택이다.
 해당 분기에서 평가 노드가 실행되지 않으면 그 출력은 null이다. metadata의 정답과 outputs의 예측은 서로 다른 위치에 저장한다.
 recorded_dialogue.yaml은 입력 가드·저장 응답 source·응답 가드를 연결하고 outputs에 g11과 fb를 기록한다.
-기본 가드는 mock이므로 해당 결과는 임상 라벨이 아니다. 실제 가드는 아래 안내대로 use/params를 교체한다.
+g11은 Qwen3Guard 결과를 기록하고 g12는 mock feedback을 기록한다. 연결과 출력 형식은 아래 설명을 따른다.
 turns에는 context·history·원래 응답·원본 메시지 위치(message_index)도 기록해 어떤 창을 사용했는지 확인할 수 있다.
 
 ## 실시간 대화와 저장 대화 평가
@@ -438,8 +631,8 @@ python scripts/chat.py --pipeline configs/pipelines/live_chat.yaml --out outputs
 이 CLI는 단일 텍스트 세션이며 별도의 음성 Realtime API를 사용하지 않는다.
 
 live_chat.yaml은 prepare → [g11, bot] → g12 → route 흐름이다.
-실제 chatbot은 `chatbot/default`, 현재 가드·router는 mock이다. CLI 동작 확인만 하려면
-`--pipeline configs/pipelines/no_guard.yaml`을 선택하면 기존 chatbot mock을 사용한다.
+실제 chatbot은 `chatbot/default`, 현재 가드·router는 mock이다. 모델 호출 없이 CLI를 확인하려면
+같은 `live_chat.yaml`에서 bot의 `use`를 `chatbot/mock`, `params`를 `{}`로 바꿔 실행한다.
 실제 가드 없이 mock 가드로 실행한 결과를 임상 안전 판정으로 해석하면 안 된다.
 
 `chatbot/default`는 params의 `model` 별칭을 models.yaml에서 읽는다.
@@ -459,7 +652,7 @@ role/content 메시지로 전달한다. fb가 있으면 JSON 내용으로 별도
 실제 가드를 연결했다면 해당 가드가 요구하는 설정은 별도로 필요하다.
 
 ```bash
-python scripts/run.py --pipeline configs/pipelines/recorded_dialogue.yaml --data data/recorded_sample.jsonl --out outputs/recorded_eval
+python scripts/run.py --pipeline configs/pipelines/recorded_dialogue.yaml --data data/built/recorded/cradle_dialogue.jsonl --out outputs/recorded_eval
 ```
 
 JSONL 한 줄에 dialogue_id와 messages를 넣는다. role/content의 순서대로 각 user/assistant 쌍을 처리한다.
@@ -469,15 +662,204 @@ router가 필요한 평가 흐름은 동일한 YAML goto 규칙을 사용한다.
 `input.response_mode: recorded` 설정에 chatbot/* 노드가 있으면 로드 시 에러로 차단한다.
 기존 run.py의 JSON, JSONL, turns 문자열 리스트를 이용한 생성용 배치 동작도 유지한다.
 
-### 실제 가드 연결 위치
+### 가드레일 노드 입출력 규격
 
-recorded_dialogue.yaml의 g11/g12에 등록된 실제 평가 노드의 use와 params를 지정한다.
-g11에는 `[context, user]`, g12에는 `[context, user, candidate, g11]`을 전달한다.
-feedback은 자유 형식이며 core가 라벨을 이진화하거나 두 라벨을 합치지 않는다.
-기본 `outputs: [g11, fb]`는 각 반환값을 그대로 저장한다.
-직접 라벨 키를 반환하도록 연결했다면 out/outputs를 context_label과 chatbot_utterance_label로 지정할 수 있다.
-g12가 g11 결과를 입력받는다면 g11의 out 변경에 맞춰 g12의 in도 바꿔야 한다.
-이번에는 제공되지 않은 실제 임상 가드·프롬프트·파서를 새로 만들지 않았다.
+가드 래퍼는 `Node`를 상속하고 `async def run(self, inputs: dict)`에서 결과를 반환한다.
+생성자에는 YAML의 `params`가 전달되고, `run()`에는 YAML의 `in`에 선언한 키만 전달된다.
+아래는 현재 g11/g12와 router를 서로 교체해서 연결하기 위한 형식이다.
+core는 가드 결과의 내부 스키마나 라벨 의미를 검증하지 않으므로 래퍼와 소비 노드에서 이 형식을 맞춘다.
+
+| 노드 | YAML `in` | 반환값이 저장되는 YAML `out` | 소비 위치 |
+| --- | --- | --- | --- |
+| g11 입력 가드 | `[context, user]` | `g11` | g12, 입력 gate, 결과 기록 |
+| g12 응답 가드 / feedback | `[context, user, candidate, g11]` | `fb` | router, 재생성 chatbot, 결과 기록 |
+
+`g11`/`fb`는 state 키 이름이다. 노드는 **결과 객체 자체**를 반환한다.
+예를 들어 `return {"label": "safe", ...}`를 사용하면 `out: g11`이 그 객체 전체를 저장한다.
+반환값을 다시 `{"g11": ...}`로 감싸지 않는다. 출력은 JSON으로 저장 가능한 dict/list/문자열/숫자/bool/null로 만든다.
+Tensor, 모델 객체, Exception 객체는 반환값에 넣지 않는다.
+
+#### g11 입력: 현재 user를 포함한 평가 창
+
+```json
+{
+  "context": [
+    {"role": "user", "content": "이전 질문"},
+    {"role": "assistant", "content": "이전 응답"},
+    {"role": "user", "content": "현재 질문"}
+  ],
+  "user": "현재 질문"
+}
+```
+
+| 필드 | 타입 | 규칙 |
+| --- | --- | --- |
+| `context` | `list[dict]` | 시간순 user/assistant 메시지. 각 메시지는 `role`, 문자열 `content`를 포함한다. 기본 최대 5개 **메시지**다. |
+| `user` | `str` | 현재 사용자 발화. `context[-1]`의 role은 user이고 content는 이 값과 같다. |
+
+context에는 system, 현재 후보 응답, 미래 발화, 원본 라벨이 들어가지 않는다.
+현재 user는 이미 context에 있으므로 모델용 메시지를 만들 때 다시 붙이지 않는다.
+`history`는 현재 user 이전의 전체 대화이며, 필요할 때만 YAML `in`에 별도로 선언한다.
+`chat_context`는 챗봇용 압축 입력이고 가드의 평가 창은 `context`를 사용한다.
+
+#### g11 출력: 판정 객체
+
+```json
+{
+  "label": "unsafe",
+  "categories": ["Suicide & Self-Harm"],
+  "raw": {
+    "output": "Safety: Unsafe\nCategories: Suicide & Self-Harm",
+    "safety": "Unsafe",
+    "categories": ["Suicide & Self-Harm"],
+    "parse_error": null
+  }
+}
+```
+
+| 필드 | 타입 | 규칙 |
+| --- | --- | --- |
+| `label` | `str` | Qwen 래퍼에서는 `safe`, `unsafe`, `controversial`, `unresolved`. 원본 `Safe/Unsafe/Controversial`을 소문자로 대응시키며 파싱 실패는 unresolved다. |
+| `categories` | `list[str]` | 모델의 category 이름을 보존한다. Qwen의 `None`은 빈 목록 `[]`으로 대응시킨다. |
+| `raw` | `dict` 또는 `null` | 원래 출력과 파싱/모델 정보를 보존한다. Qwen 래퍼는 dict, 중립 mock은 null을 사용할 수 있다. |
+
+현재 g12 mock은 `g11.label`과 `g11.categories`를 읽으므로 두 키를 제공한다.
+Qwen의 raw에는 위 예시에 더해 `model_id`, `revision`, `device`, `input_tokens`,
+`generated_tokens`가 들어간다. 키워드 mock은 raw에 `matched` 등을 넣는다.
+모델별 원문이나 진단 정보는 raw에 두고 downstream이 읽는 label/categories를 맞춘다.
+
+#### g12 입력: 평가 창 + 현재 후보 + g11 결과
+
+```json
+{
+  "context": [{"role": "user", "content": "현재 질문"}],
+  "user": "현재 질문",
+  "candidate": "현재 평가할 assistant 응답",
+  "g11": {"label": "safe", "categories": [], "raw": null}
+}
+```
+
+`context`와 `user`는 g11과 같은 값이다. `candidate`는 문자열이며 generate에서는
+챗봇 후보, recorded에서는 저장된 assistant 응답이다. `g11`은 입력 가드의 반환 객체 전체다.
+응답 moderation 모델에는 `context + [{"role": "assistant", "content": candidate}]`를 전달한다.
+g11 판정은 별도 판단 근거로 사용하고 대화 원문 메시지에 섞지 않는다.
+g12는 g11과 후보 준비가 끝난 뒤 실행되며, 후보를 재생성하면 새 candidate로 다시 평가한다.
+
+#### g12 출력: router / chatbot에 전달할 feedback
+
+현재 `guard_out/mock`의 retry/fallback 모드 반환 형식은 다음과 같다.
+아래 수치는 형식 예시다. constant 모드는 설정한 feedback dict를 그대로 반환한다.
+
+```json
+{
+  "retry_requested": false,
+  "fallback_requested": true,
+  "notes": ["Suicide & Self-Harm"],
+  "candidate_length": 24
+}
+```
+
+| 필드 | 타입 | 현재 소비 규칙 |
+| --- | --- | --- |
+| `retry_requested` | `bool` | router가 재생성 횟수 한도 안에서 bot으로 이동한다. |
+| `fallback_requested` | `bool` | router가 fallback으로 이동한다. 둘 다 true면 fallback이 우선한다. |
+| `notes` | `list[str]` | 현재 mock은 g11.categories를 복사한다. feedback 전체는 재생성 chatbot에도 전달된다. |
+| `candidate_length` | `int` | `len(candidate)`로 구한 문자 수. 토큰 수가 아니다. |
+
+현재 mock은 `g11.label == "unsafe"`일 때 지정한 mode에 따라 요청 flag를 켠다.
+controversial/unresolved에는 flag를 켜지 않는다. 실제 응답 평가기를 연결할 때는
+해당 라벨에 대한 처리 정책을 가드 또는 router에서 명시한다.
+응답 평가 결과를 함께 저장하려면 fb 객체에 `label`, `categories`, `raw`를 추가할 수 있다.
+router와 연결하는 요청 flag는 그대로 유지하고, chatbot은 feedback 객체 전체를 받는다는 점을 고려한다.
+core는 fb의 label을 g11 라벨과 합치거나 자동으로 판정하지 않는다.
+
+`routers/mock`은 feedback의 요청 키가 없으면 false로 취급한다.
+다른 feedback 형식을 반환하는 가드는 소비하는 router도 같은 형식에 맞춰 연결한다.
+recorded YAML은 router 없이 평가 결과만 기록하며 저장 응답을 그대로 유지한다.
+가드 반환값이 `final` 응답이 되는 것이 아니라 최종 문자열 candidate가 final이 된다.
+
+#### 기록과 오류 처리
+
+YAML의 `outputs: [g11, fb]`를 지정하면 두 객체가 `turns.jsonl`의 `outputs.g11`,
+`outputs.fb`에 그대로 저장된다. `trace.jsonl`에는 노드별 입력과 반환값이 기록된다.
+원본 정답·출처·주석은 `metadata.dialogue`, `metadata.user`, `metadata.assistant`에 남고
+가드 입력으로 자동 전달되지 않는다. 키 이름을 바꾸면 생산 노드의 `out`, 소비 노드의 `in`,
+기록할 `outputs`를 함께 바꾼다.
+
+Qwen 출력 파싱 실패는 `label: unresolved`와 `raw.parse_error`로 기록하며
+추론이 정상 반환됐으면 턴 status는 ok다. 모델 로드 실패나 입력 길이 초과 등
+실행 예외는 Runner가 턴 `status: error`, `error`, `final: null`로 기록하고
+해당 대화의 이후 턴을 중단한다. 실행되지 않은 outputs 키는 null로 기록된다.
+래퍼는 history/user/context를 덮어쓰지 않고 자신의 반환 객체만 만든다.
+
+### g11 Qwen3Guard 래퍼와 연결
+
+실행은 기존 `scripts/run.py` / `scripts/chat.py`를 사용하고, 가드 구현은
+`src/guardbench/nodes/guard_in/qwen3guard.py`의 `Qwen3Guard(Node)`에 둔다.
+이 파일에서 모델 로드, tokenizer 챗템플릿 적용, 추론, 출력 파싱을 처리한다.
+모델·tokenizer는 프로세스 안에서 재사용하며 첫 `run()` 때 로드한다.
+노드 생성자와 YAML 로드 단계에서는 모델을 로드하지 않는다.
+로컬 모델 실행은 worker thread에서 처리하고 공유 모델 접근을 직렬화한다.
+
+| 역할 | 구현 위치 | 입력 / 출력 |
+| --- | --- | --- |
+| g11 입력 평가 | `src/guardbench/nodes/guard_in/qwen3guard.py` | `context, user` → `g11` |
+| g12 mock feedback | `src/guardbench/nodes/guard_out/mock.py` | `context, user, candidate, g11` → `fb` |
+| 모델 설정 | `configs/models.yaml`의 `qwen3guard` | 로컬 모델 경로, revision, 장치, 생성 설정 |
+| 저장 평가 배선 | `configs/pipelines/recorded_dialogue.yaml` | `[g11, source] → g12` |
+
+`recorded_dialogue.yaml`은 다음처럼 g11 래퍼를 선택한다:
+
+```yaml
+nodes:
+  g11:
+    use: guard_in/qwen3guard
+    in: [context, user]
+    out: g11
+    params: {model: qwen3guard}
+outputs: [g11, fb]
+```
+
+`use`는 `@register("guard_in/qwen3guard")`로 등록된 클래스를 자동으로 불러온다.
+다른 설정 파일은 `params.models_config`로 지정하며 상대 경로는 `guardbench/` 기준이다.
+실시간에도 같은 래퍼를 연결하려면 `live_chat.yaml`의 g11 `use/params`를 위와 같이 지정한다.
+가드를 교체할 때는 해당 위치의 `use/params`를 바꾸고 기존 `in/out/flow`를 사용한다.
+
+래퍼는 현재 user를 포함한 `context`의 role/content만 모델에 전달한다.
+user를 중복으로 붙이거나 원본 라벨·주석을 메시지에 넣지 않는다.
+`tokenizer.apply_chat_template(messages, tokenize=False)` → tokenize → generate →
+새로 생성된 토큰만 decode 순서로 실행하며, context를 조용히 잘라내지 않는다.
+모델 컨텍스트 용량을 넘으면 턴 오류로 기록한다.
+
+출력은 `label: safe/unsafe/controversial`, `categories`, `raw`다.
+`raw`에는 원래 출력, 원래 Safety/Categories, parse_error, 모델 ID/revision,
+장치와 입력/생성 토큰 수를 남긴다. 파싱 실패는 `unresolved`로 기록한다.
+가드 결과는 `turns.jsonl`의 `outputs.g11`에, 노드 입출력은 `trace.jsonl`에 저장된다.
+g12 mock은 g11 결과에서 feedback을 만들고 recorded 모드의 원래 assistant 응답을 유지한다.
+feedback 규칙은 `guard_out/mock.py`에서 확인할 수 있다.
+
+### CRADLE로 g11 실행
+
+환경 활성화와 새 출력 폴더 생성을 포함한 복사 가능한 명령은
+[공통 실행 명령](#공통-실행-명령과-재현-정보)에 저장한다.
+`--split`은 JSONL의 split 필드로 선택하고 `--limit`은 선택 후 대화 개수를 제한한다.
+둘 다 생략하면 전체 입력을 실행한다. `--show-turns`는 각 턴의 user, history/context 길이,
+노드 outputs와 최종 응답을 출력한다.
+이 경로에서는 g11이 Qwen3Guard-Gen을 호출하고 candidate는 저장된 응답에서 가져온다.
+
+키워드 mock으로 비교하려면 같은 YAML의 g11만 다음으로 교체하고 같은 `run.py`를 사용한다:
+
+```yaml
+  g11:
+    use: guard_in/mock
+    in: [context, user]
+    out: g11
+    params: {scope: context, keywords: ['freaking out', scared, suicide, self-harm]}
+```
+
+mock의 `scope: user`는 현재 user, `scope: context`는 최근 user/assistant 메시지를 검사한다.
+키워드는 대소문자를 무시한 부분 문자열로 검사하고 context의 일치 위치·화자는
+`raw.matched_messages`에 남긴다.
 
 ### 두 경로의 결과 파일
 
@@ -485,7 +867,3 @@ g12가 g11 결과를 입력받는다면 g11의 out 변경에 맞춰 g12의 in도
 - turns.jsonl: 최종 응답, 원문 history/context, outputs 평가 결과, calls, status/error, metadata.
 - 실시간: response_mode는 generate, recorded_response는 null, metadata.input_path는 live.
 - 저장 평가: response_mode는 recorded, 성공한 턴은 final과 recorded_response가 같다. 원본 message_index와 처리 대상 metadata를 기록한다. 오류 턴의 final은 null이다.
-
-네트워크 없는 테스트는 test_input_paths.py에서 fake backend를 실제 chatbot/default에 연결해
-모델 설정 전달·응답 history 누적·클라이언트 종료를 확인한다. 2턴 JSONL에서는 평가 노드가 저장된 응답을 받고
-chatbot backend가 호출되지 않는지 검사한다. CLI 테스트도 실제 API를 호출하지 않는다.
