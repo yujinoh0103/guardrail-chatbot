@@ -10,6 +10,49 @@ from .node import Node, resolve
 from .state import INITIAL_KEYS
 
 
+def comparison_variants(config):
+    """Build condition-specific pipelines; each is run with its own dialogues/history."""
+    comparison = config.get("comparison")
+    if comparison is None:
+        return [(None, Pipeline.from_dict(config))]
+    if not isinstance(comparison, dict):
+        raise ValueError("comparison must be a mapping")
+    conditions = comparison.get("conditions", [])
+    allowed = {"baseline", "label", "category", "rationale", "brief", "explanation"}
+    if not isinstance(conditions, list) or not conditions or not all(isinstance(c, str) and c in allowed for c in conditions) or len(set(conditions)) != len(conditions):
+        raise ValueError("comparison requires unique supported conditions")
+    bot = comparison.get("node", "bot")
+    guard = comparison.get("guard_node", "g11")
+    feedback = comparison.get("feedback_node", "feedback")
+    if len({bot, guard, feedback}) != 3 or any(name not in config.get("nodes", {}) for name in (bot, guard, feedback)):
+        raise ValueError("comparison requires distinct chatbot, guard and feedback nodes")
+    if config["nodes"][bot]["use"] != "chatbot/default":
+        raise ValueError("comparison node must use chatbot/default")
+    variants = []
+    for condition in conditions:
+        variant = deepcopy(config)
+        variant.pop("comparison")
+        removed = {guard, feedback} if condition == "baseline" else {feedback} if condition in ("label", "category") else set()
+        removed_outputs = {variant["nodes"][name]["out"] for name in removed}
+        for name in removed:
+            del variant["nodes"][name]
+        spec = variant["nodes"][bot]
+        spec.setdefault("params", {})["condition"] = condition
+        spec["in"] = [key for key in spec["in"] if key.removesuffix("?") not in removed_outputs]
+        flow = []
+        for item in variant["flow"]:
+            if isinstance(item, list):
+                remaining = [name for name in item if name not in removed]
+                if remaining:
+                    flow.append(remaining)
+            elif item not in removed:
+                flow.append(item)
+        variant["flow"] = flow
+        variant["outputs"] = [key for key in variant.get("outputs", []) if key not in removed_outputs]
+        variants.append((condition, Pipeline.from_dict(variant)))
+    return variants
+
+
 @dataclass(frozen=True)
 class NodeSpec:
     use: str
@@ -34,6 +77,7 @@ class Pipeline:
     response_mode: str = "generate"
     context_messages: int = 5
     outputs: tuple[str, ...] = ()
+    replay_users: bool = False
 
     @classmethod
     def load(cls, path: str | Path) -> "Pipeline":
@@ -124,6 +168,9 @@ class Pipeline:
             raise ValueError("input must be a mapping")
         response_mode = input_config.get("response_mode", "generate")
         context_messages = input_config.get("context_messages", 5)
+        replay_users = input_config.get("replay_users", False)
+        if not isinstance(replay_users, bool) or (replay_users and response_mode != "generate"):
+            raise ValueError("replay_users requires a boolean and response_mode generate")
         if response_mode not in ("generate", "recorded"):
             raise ValueError("response_mode must be generate or recorded")
         if response_mode == "recorded" and any(spec.use.startswith("chatbot/") for spec in nodes.values()):
@@ -136,4 +183,4 @@ class Pipeline:
         if len(set(outputs)) != len(outputs):
             raise ValueError("outputs must not contain duplicate keys")
         return cls(nodes, tuple(flow), tuple(parallel), positions, final, max_steps,
-                   response_mode, context_messages, tuple(outputs))
+                   response_mode, context_messages, tuple(outputs), replay_users)

@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 import json
+import re
 from pathlib import Path
 
 
@@ -69,3 +70,27 @@ def load_dialogues(path: str | Path) -> list[dict]:
 
 def metadata(item: dict, excluded: tuple[str, ...]) -> dict:
     return deepcopy({key: value for key, value in item.items() if key not in excluded})
+
+
+def source_labels(message: dict) -> list[str]:
+    """Original utterance labels, including adjacent messages merged by the builder."""
+    native = message.get("native", {})
+    parts = native.get("merged_parts", [native])
+    labels = []
+    for part in parts:
+        for label in part.get("labels", "").split(";"):
+            label = label.strip()
+            if label and label not in labels:
+                labels.append(label)
+    return labels
+
+
+def source_risk_labels(message: dict) -> list[dict]:
+    """Parse exact CRADLE SI/SH tags without treating SHA as self-harm."""
+    result = []
+    for label in source_labels(message):
+        match = re.fullmatch(r"confirm_(SI_(passive|active)|SH)_(ongoing|past)", label)
+        if match:
+            result.append({"raw": label, "family": "SI" if match[2] else "SH",
+                           "subtype": match[2], "time": match[3]})
+    return result

@@ -1,0 +1,83 @@
+# VERA-MH personas as simulated users. Each condition is an independent conversation,
+# so the user's next message and hidden state react to that condition's replies.
+# Hidden state per turn: turns.jsonl metadata.user_state; full trajectory: trace.jsonl user_sim events.
+simulator:
+  model: user_simulator
+  prompt_path: prompts/user_simulator.yaml
+  personas: data/built/personas/v2_small.jsonl
+  max_turns: 10
+  max_step: 2
+input:
+  response_mode: generate
+  context_messages: 5
+comparison:
+  node: bot
+  guard_node: g11
+  feedback_node: feedback
+  conditions:
+  - explanation
+nodes:
+  prepare:
+    use: history/chatbot
+    in:
+    - history
+    - user
+    out: chat_context
+    params:
+      max_chars: 8192
+      recent_messages: 4
+      summary_chars: 1024
+      excerpt_chars: 160
+  # Qwen3Guard (all categories) + expert11 (suicide/self-harm); see nodes/guard_in/combined.py.
+  g11:
+    use: guard_in/combined
+    in:
+    - context
+    - user
+    out: g11
+    params:
+      qwen_model: qwen3guard
+      si_policy: expert11
+      controversial: unsafe
+      expert11:
+        judge: jev
+        unsafe_from: low
+  bot:
+    use: chatbot/default
+    in:
+    - chat_context
+    - g11
+    - feedback
+    out: candidate
+    params:
+      model: chatbot_comparison
+      prompt_path: prompts/cradle_dialogue.yaml
+      prompt_profile: listener
+      condition: explanation
+  feedback:
+    use: guard_out/feedback
+    in:
+    - context
+    - g11
+    out: feedback
+    params:
+      model: feedback
+      prompt_path: prompts/feedback.yaml
+      length_retries: 1
+      skip_when_safe: true
+      max_chars:
+        rationale: 320
+        brief: 120
+        explanation: 320
+flow:
+- - prepare
+  - g11
+- feedback
+- bot
+final: candidate
+outputs:
+- g11
+- feedback
+- candidate
+limits:
+  max_steps: 20

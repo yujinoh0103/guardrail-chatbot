@@ -31,6 +31,7 @@ class OpenRouterClient(Backend):
         result = await self.client.chat.completions.create(
             model=self.model, messages=messages, **self.sampling,
         )
+        self.usage = result.usage.model_dump() if result.usage is not None else None
         if not result.choices or not isinstance(result.choices[0].message.content, str):
             raise ValueError("Chat backend returned no text response")
         return result.choices[0].message.content

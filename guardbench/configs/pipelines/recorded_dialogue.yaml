@@ -1,23 +1,73 @@
-# Qwen3Guard evaluates the input; g12 produces mock feedback from its result.
-input: {response_mode: recorded, context_messages: 5}
+# Stored user inputs, five independent GPT-5 Nano conversations, short GPT-5.6 Luna feedback.
+input:
+  response_mode: generate
+  replay_users: true
+  context_messages: 5
+comparison:
+  node: bot
+  guard_node: g11
+  feedback_node: feedback
+  conditions:
+  - baseline
+  - label
+  - rationale
+  - brief
+  - explanation
 nodes:
+  prepare:
+    use: history/chatbot
+    in:
+    - history
+    - user
+    out: chat_context
+    params:
+      max_chars: 8192
+      recent_messages: 4
+      summary_chars: 1024
+      excerpt_chars: 160
   g11:
     use: guard_in/qwen3guard
-    in: [context, user]
+    in:
+    - context
+    - user
     out: g11
-    params: {model: qwen3guard}
-  source:
-    use: misc/recorded_response
-    in: [recorded_response]
+    params:
+      model: qwen3guard
+  bot:
+    use: chatbot/default
+    in:
+    - chat_context
+    - g11
+    - feedback
     out: candidate
-  g12:
-    use: guard_out/mock
-    in: [context, user, candidate, g11]
-    out: fb
-    params: {mode: fallback}
+    params:
+      model: chatbot_comparison
+      prompt_path: prompts/cradle_dialogue.yaml
+      prompt_profile: listener
+      condition: rationale
+  feedback:
+    use: guard_out/feedback
+    in:
+    - context
+    - g11
+    out: feedback
+    params:
+      model: feedback
+      prompt_path: prompts/feedback.yaml
+      length_retries: 1
+      max_chars:
+        rationale: 320
+        brief: 120
+        explanation: 320
 flow:
-  - [g11, source]
-  - g12
+- - prepare
+  - g11
+- feedback
+- bot
 final: candidate
-outputs: [g11, fb]
-limits: {max_steps: 20}
+outputs:
+- g11
+- feedback
+- candidate
+limits:
+  max_steps: 20

@@ -10,3 +10,5 @@ outputs/*
 !outputs/.gitkeep
 .pytest_cache/
 data/built/recorded/
+# External checkouts at pinned commits (GoalEx, sdx_guardrail); rebuilt by their adapters.
+third_party/

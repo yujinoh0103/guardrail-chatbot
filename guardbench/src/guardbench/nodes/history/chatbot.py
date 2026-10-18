@@ -1,11 +1,15 @@
-"""Bounded, deterministic history excerpts for chatbot input."""
+"""Chatbot history: the one place that decides how much past conversation the chatbot sees.
+
+Recent messages go in verbatim; older ones become short excerpts until a size budget is used up,
+and anything older is dropped. Guards and feedback use the separate `context` window.
+"""
 
 import json
 
 from ...core.node import Node, register
 
 
-@register("misc/chat_context")
+@register("history/chatbot")
 class ChatContext(Node):
     def __init__(self, sleep=0.0, max_chars=8192, recent_messages=4,
                  summary_chars=1024, excerpt_chars=160):
