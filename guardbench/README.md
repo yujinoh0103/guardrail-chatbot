@@ -1580,8 +1580,67 @@ mock의 `scope: user`는 현재 user, `scope: context`는 최근 user/assistant 
 
 ## 시뮬레이터 사용자와 외부 judge
 
-`configs/pipelines/simulated_user.yaml`은 저장된 user 발화 대신 VERA-MH의 자살 위험 페르소나 100개
-(`data/external/vera_mh/SI/personas.tsv`, 출처와 라이선스는 같은 폴더 `SOURCE.md`)로 사용자를 시뮬레이션한다.
+### 빠른 시작: 페르소나 시뮬레이터 ↔ 챗봇 멀티턴 대화
+
+흐름: 시뮬레이터가 페르소나로 user 발화 생성 → `history/chatbot`(챗봇용 히스토리) + g11(Qwen3Guard + expert11)
+→ unsafe면 explanation 피드백 생성(safe면 건너뜀) → 챗봇 응답 → 시뮬레이터가 그 응답을 보고 다음 발화.
+
+```bash
+# 0. 작업공간(guardbench의 상위 폴더)에서 한 번만
+python -m venv .venv
+.venv/bin/python -m pip install -r guardbench/requirements.txt
+cd guardbench
+echo "OPENROUTER_API_KEY=<키>" > .env            # 시뮬레이터, Jev(expert11), 피드백, 챗봇이 사용
+
+# 1. Qwen3Guard 모델 (git 제외, 한 번만)
+hf download Qwen/Qwen3Guard-Gen-0.6B --revision fada3b2f655b89601929198343c94cd2f64d93cc \
+    --local-dir models/Qwen3Guard-Gen-0.6B
+printf '{"model_id": "Qwen/Qwen3Guard-Gen-0.6B", "revision": "fada3b2f655b89601929198343c94cd2f64d93cc"}\n' \
+    > models/Qwen3Guard-Gen-0.6B/download_manifest.json
+# expert11(sdx_guardrail)은 첫 실행 때 third_party/에 고정 커밋으로 자동 clone된다.
+
+# 2. 대화 실행: 페르소나 1명, 최대 10턴, 턴마다 화면 출력
+../.venv/bin/python scripts/run.py --pipeline configs/pipelines/simulated_user.yaml \
+    --dialogue-id vera_mh_si:Harper --max-turns 10 \
+    --out outputs/sim_$(date +%m%d_%H%M) --show-turns
+
+# 샘플 페르소나 28명 전체
+../.venv/bin/python scripts/run.py --pipeline configs/pipelines/simulated_user.yaml \
+    --max-turns 10 --concurrency 4 --out outputs/sim_all_$(date +%m%d_%H%M)
+
+# 3. 결과
+../.venv/bin/python scripts/user_state_report.py --run outputs/<폴더>   # 숨김 상태 변화 요약
+```
+
+| 옵션 | 뜻 |
+| --- | --- |
+| `--dialogue-id <id>` | 페르소나 선택(반복 가능). id는 `data/built/personas/v2_small.jsonl`의 `dialogue_id` |
+| `--limit N` | 앞에서 N명 |
+| `--max-turns N` | 최대 user 턴 수(기본 10). 시뮬레이터가 끝내면 더 일찍 멈춘다 |
+| `--data <파일>` | 다른 페르소나 파일(VERA-MH TSV 또는 `scripts/build_personas.py` 결과 JSONL) |
+| `--risk-level High` | 자살 위험 수준으로 선택. `risk_level`이 있는 VERA-MH·Reddit 페르소나만 해당 |
+| `--show-turns` | 턴이 끝날 때마다 user 상태, g11 판정, user/챗봇 발화를 출력 |
+
+결과 폴더: `turns.jsonl`(턴별 발화, g11, 피드백. 건너뛴 피드백은 `outputs.feedback.skipped`),
+`trace.jsonl`(노드별 입출력, 시뮬레이터 상태, 모델 요청).
+
+설정은 `configs/pipelines/simulated_user.yaml` 한 곳에서 바꾼다.
+
+| 바꿀 것 | 위치 |
+| --- | --- |
+| 피드백 종류 | `comparison.conditions` (지금 `explanation`). `baseline`을 추가하면 피드백 없는 대화를 같은 페르소나로 따로 진행 |
+| safe일 때 피드백 생략 | `feedback.params.skip_when_safe` (지금 true) |
+| 챗봇이 보는 히스토리 | `prepare`(`history/chatbot`)의 `recent_messages`(원문 메시지 수, 지금 4)와 `summary_chars`(오래된 메시지 발췌 길이, 지금 1024) |
+| 가드가 보는 창 | `input.context_messages` (지금 최근 5개 메시지) |
+| 페르소나 파일 | `simulator.personas` (지금 `data/built/personas/v2_small.jsonl`) |
+| 모델 | `configs/models.yaml`의 `user_simulator`, `feedback`, `chatbot_comparison`, `qwen3guard` |
+
+턴마다 LLM 호출은 시뮬레이터, Jev, 챗봇에 unsafe 턴이면 피드백까지다. Qwen3Guard는 로컬 GPU에서 돈다.
+
+### 페르소나와 숨김 상태
+
+페르소나는 `data/built/personas/v2_small.jsonl`(28명, 칸별 설명은 같은 폴더 `README.md`)이다.
+VERA-MH TSV(`data/external/vera_mh/SI/personas.tsv`)도 `--data`로 그대로 쓸 수 있다.
 조건마다 독립 대화이므로 다음 user 발화가 그 조건의 응답에 반응한다.
 
 시뮬레이터는 매 턴 챗봇에 보이지 않는 내부 상태를 함께 출력한다(`prompts/user_simulator.yaml`).
@@ -1591,11 +1650,12 @@ Stanley-Brown 기준 help seeking, trust in chatbot, SUDS distress, disclosure.
 코드가 턴당 변화폭을 제한하고(ideation ±1, 나머지 ±`max_step`), disclosure 감소와 페르소나와 맞지 않는
 시작 ideation을 보정한다. 보정 내역은 trace의 `user_sim.output.adjustments`에 남는다.
 
+숨김 상태 축은 첫 버전이며, 상당수가 한 번의 대화로는 거의 변하지 않아 교체 예정이다.
+
+### 외부 judge (VERA-MH)
+
 ```bash
-python scripts/run.py --pipeline configs/pipelines/simulated_user.yaml --out outputs/sim_x \
-    --risk-level High --limit 5 --max-turns 10
-python scripts/user_state_report.py --run outputs/sim_x   # 조건·위험수준별 (최종 - 시작) 변화
-python scripts/export_vera.py --run outputs/sim_x          # 조건별 VERA-MH 전사
+../.venv/bin/python scripts/export_vera.py --run outputs/<폴더>   # 조건별 VERA-MH 전사
 ```
 
 외부 judge는 VERA-MH 저장소에서 실행한다(5개 차원: Detects Potential Risk, Confirms Risk,
